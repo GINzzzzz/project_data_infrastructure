@@ -133,7 +133,7 @@ COMMENT ON COLUMN 	datatables.action_plan.name_np
 IS 					'Name of a settlement where the action is taken. Only for objects inside a single settlement.';
 
 COMMENT ON COLUMN 	datatables.action_plan.regno 
-IS 					'Registration code of the effected object accord. to official registries. For new objects - mark �.�.';
+IS 					'Registration code of the effected object accord. to official registries. For new objects - mark н.д.';
 COMMENT ON COLUMN 	datatables.action_plan.name_full 
 IS 					'Full name (title) of the effected or new object accord. to official docs. 500 characters max. (incl. spaces).';
 COMMENT ON COLUMN 	datatables.action_plan.name_short 
@@ -196,11 +196,11 @@ COMMENT ON COLUMN 	datatables.action_plan.cap6
 IS 					'Aux object capacity parameter (6).';
 
 COMMENT ON COLUMN 	datatables.action_plan.param1_lin_i 
-IS 					'Linear object parameter (length) unit. Commonly - ��.';
+IS 					'Linear object parameter (length) unit. Commonly - КМ';
 COMMENT ON COLUMN 	datatables.action_plan.param1_lin 
 IS 					'Linear object parameter (length).';
 COMMENT ON COLUMN 	datatables.action_plan.param2_cnt_i 
-IS 					'Quantative parameter unit. Commonly - ��. with pointing countable entities if several. E.g. �� (���. ����)';
+IS 					'Quantative parameter unit. Commonly - ЕД with pointing countable entities if several. E.g. ЕД (дор. знак)';
 COMMENT ON COLUMN 	datatables.action_plan.param2_cnt 
 IS 					'Quantative parameter. Number of objects or contents incl. in the object (data row)';
 COMMENT ON COLUMN 	datatables.action_plan.param3_sqr_i 
