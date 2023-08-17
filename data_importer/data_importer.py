@@ -1,9 +1,11 @@
+import os
 import pandas as pd
 import numpy as np
 import math
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.dialects import postgresql
+from psycopg2.extensions import register_adapter, AsIs
 from sqlalchemy import Table, Column, INTEGER, NUMERIC, VARCHAR
 
 
@@ -11,7 +13,7 @@ class Session:
     """
 
     """
-    def __init__(self, cl_dbase, cl_dbtable, cl_user, cl_pass):
+    def __init__(self, cl_dbase, cl_dbtable, cl_user, cl_pass, cl_directory):
         """
         Initialisation of Import Session. Session is considered as a process
         of a given data import. Data is presented to the class as the pandas
@@ -32,23 +34,24 @@ class Session:
         self.dbdct_regions = 'codes_regions'                                                                            # ref. tbl w/OKATO, plate codes, names of regions.
 
         # ClSES.1 Init vars.
+        self.import_dir = cl_directory
         self.dbase = cl_dbase
         self.dbtable = cl_dbtable
         self.dbuser = cl_user
         self.dbpass = cl_pass
 
-        modes = {'infra_objects': 1,
-                 'ptv_routes': 2,
-                 'ptv_vehs': 3,
-                 'action_plan': 4}
-        idx_cols = {1: 'id_object', 2: 'id_thread', 3: 'id_vehset', 4: 'id_act'}
+        self.modes = {'infra_objects': 1,
+                      'ptv_routes': 2,
+                      'ptv_vehs': 3,
+                      'action_plan': 4}
+        self.idx_cols = {1: 'id_object', 2: 'id_thread', 3: 'id_vehset', 4: 'id_act'}
 
         try:
-            self.mode = modes[self.dbtable]
+            self.mode = self.modes[self.dbtable]
         except KeyError:
             print('Режим проверки не определен (целевая таблица не существует).')
 
-        self.idx_col = idx_cols[self.mode]
+        self.idx_col = self.idx_cols[self.mode]
         self.download_dcts()
 
     def choice(self, alternatives):
@@ -198,6 +201,9 @@ class Session:
         self.lst_dbtcols_decim = self.df_dbtcols.loc[
             self.df_dbtcols.data_type.isin(['numeric']), 'column_name'
         ].to_list()
+        self.lst_dbtcols_bool = self.df_dbtcols.loc[
+            self.df_dbtcols.data_type.isin(['boolean']), 'column_name'
+        ]
         self.lst_dbtcols_arvarch = self.df_dbtcols.loc[
             (self.df_dbtcols.data_type == 'ARRAY') &
             (self.df_dbtcols.udt_name.isin(['_int4', '_int8'])), 'column_name'
@@ -234,7 +240,7 @@ class Session:
         except ValueError:
             new_index_start = 0
 
-        print(new_index_start)
+        # print(new_index_start)                                                                                        # ! TEST. Initial number for idxs.
         local_iter = iter(range(new_index_start + 1,
                                 new_index_start + len(self.df) + 1))
         df_reindexing.id_after = df_reindexing.id_after.apply(
@@ -245,12 +251,18 @@ class Session:
                              str(self.oid_dbtable)
         )
         # Download of the file.
-        df_reindexing.to_csv('dct_reindexing.csv', sep=';')
+        df_reindexing.to_csv(os.path.join(self.import_dir,
+                                          'dct_reindexing.csv'), sep=';')
 
         # JOINT PTV IMPORT: Reserve download of before and after indices for
         # joint ptv_routes and ptv_vehs import to use them for ptv_veh data.
-        if (self.route_vehs is True) and (self.run == 0):
-            df_reindexing.to_csv('dct_threadidx.csv', sep=';')
+        if (
+                self.routes_vehs is True
+        ) and (
+                self.first_run is True
+        ):
+            df_reindexing.to_csv(os.path.join(self.import_dir,
+                                              'dct_threadidx.csv'), sep=';')
 
         self.df[self.idx_col] = self.df[self.idx_col].astype('object')                                                  # !!!! REPEAT! 1-0 Subj to corr.
         self.df = self.df.merge(df_reindexing,
@@ -286,14 +298,15 @@ class Session:
         File dct_threadidx.csv is required. See ClSES.SfREINDX.
         :return: nothing, changes initial dataframe self.df.
         """
-        self.df['threads_idx'] = self.df['threads_idx'].apply(lambda x:
+        self.df['threads_idxs'] = self.df['threads_idxs'].apply(lambda x:
                                                               x[1:-1].replace(' ', '').split(','))
-        df_threadsidx = pd.read_csv('dct_threadidx.csv', sep=';')
-        self.df['threads_idx'] = self.df['threads_idx'].apply(lambda x:
+        df_threadsidx = pd.read_csv(os.path.join(self.import_dir,
+                                                 'dct_threadidx.csv'), sep=';')
+        self.df['threads_idxs'] = self.df['threads_idxs'].apply(lambda x:
                                                               [df_threadsidx.loc[
-                                                                   df_threadsidx['id_before'] == i,
+                                                                   df_threadsidx['id_before'].astype('str') == i,
                                                                    'id_after'
-                                                               ] for i in x])
+                                                               ].values[0] for i in x])
 
     # ..................................................................................................................
 
@@ -317,10 +330,12 @@ class Session:
                         'thread_name']
             ref_cols = ['thread_type']
         elif self.mode == 3:
-            req_cols = ['id_vehset', 'thread_idxs', 'veh_type']
+            req_cols = ['id_vehset', 'threads_idxs', 'veh_type']
             ref_cols = ['veh_type', 'fuel_type']
         elif self.mode == 4:
             ref_cols = ['object_type', 'id_project', 'docs_idxs']
+
+        primary_errs = []
 
         # ClSES.SfPRIMPRO.1 Delete empty rows.
         self.df = self.df.dropna(how='all')
@@ -337,10 +352,12 @@ class Session:
             if col in self.df.columns:
                 self.df = self.df.drop(columns=col)
 
-        # ClSES.SfPRIMPRO.4 Checking required columns to be filled.
+        # ClSES.SfPRIMPRO.5 Checking required columns to be filled.
         for col in req_cols:
             null_errs = self.df.loc[self.df[col].isna()]
             null_errs['error_description'] = f'{col}: value is required.'
+
+        primary_errs.append(null_errs)
 
         if 'okatos_reg' in self.df.columns.to_list():
             local = self.df.loc[
@@ -375,36 +392,43 @@ class Session:
             ]
             okatos_errs['error_description'] = f'okato(-s): incorrect or empty'
             self.df['okatos_reg'] = local
+            primary_errs.append(okatos_errs)
 
         for col in ref_cols:
+
+            # local dct to define specific reference columns.
+            dct_reftables = {'object_type': [self.df_tobjects, 'tobject', 'obj_id'],
+                             'thread_type': [self.df_tobjects, 'tobject', 'obj_id'],
+                             'veh_type': [self.df_tobjects, 'tobject', 'obj_id'],
+                             'fuel_type': [self.df_fuels, 'fuel', 'id_type']}
+            reftable = dct_reftables[col]
+
             # local var inside for-cycle to process.
             local = self.df[col].astype('str').apply(lambda x:
                                                      x.split('.')[0])
             local = local.apply(lambda x:
-                                self.df_tobjects.loc[
-                                    self.df_tobjects.tobject == x, 'obj_id'
+                                reftable[0].loc[
+                                reftable[0][reftable[1]] == x,
+                                                           'obj_id'
                                 ].values[0]
-                                if x in self.df_tobjects.tobject.to_list()
-                                else x)
+                                if (x in reftable[0][reftable[1]].to_list()) and (x != 'nan')
+                                else (None if x == 'nan' else x))
             df_interim = self.df.loc[
-                (~local.isin(self.df_tobjects.obj_id.astype('str'))) &
-                (~local.isin(self.df_fuels.id_type.astype('str')))
+                (local.notna()) &
+                (~local.isin(reftable[0][reftable[2]].astype('str')))
             ]
             types_errs = df_interim.loc[
-                (~df_interim[col].isin(self.df_tobjects.tobject.to_list())) &
-                (~df_interim[col].isin(self.df_fuels.fuel.to_list()))
+                ~df_interim[col].isin(reftable[0][reftable[1]].to_list())
             ]
             self.df[col] = local
-            self.df.loc[
-                self.df[self.idx_col].isin(types_errs[self.idx_col]),
-                col
-            ] = 0
+            # self.df.loc[
+            #     self.df[self.idx_col].isin(types_errs[self.idx_col]),
+            #     col
+            # ] = 0
 
-        types_errs['error_description'] = f'{col}: object type does not conform the list of permitted.'
+            types_errs['error_description'] = f'{col}: object type does not conform the list of permitted.'
 
-        primary_errs = [df for df in (
-            null_errs, okatos_errs, types_errs
-        ) if len(df) > 0]
+        primary_errs = [df for df in primary_errs if len(df) > 0]
 
         if len(primary_errs) > 1:
             self.df_errs = pd.concat(primary_errs)
@@ -445,6 +469,8 @@ class Session:
                                         set(self.df.columns))
         self.lst_dbtcols_arinteg = list(set(self.lst_dbtcols_arinteg) &
                                         set(self.df.columns))
+        self.lst_dbtcols_bool = list(set(self.lst_dbtcols_bool) &
+                                     set(self.df.columns))
 
         for row in self.df.iterrows():
 
@@ -473,8 +499,9 @@ class Session:
                     try:
                         int(str(row[1][col]).split('.')[0])
                     except ValueError:
-                        self.err_add(row,
-                                     err_text=f'{col}: not integer.')                                                   # ClSES.SfERRA.
+
+                        if row[1][col] is not None:
+                            self.err_add(row, err_text=f'{col}: not integer.')                                          # ClSES.SfERRA.
 
             # ClSES.SfLICHEK.3 Check of NUMERIC cols on dtype.
             for col in self.lst_dbtcols_decim:
@@ -484,24 +511,36 @@ class Session:
                 except [ValueError, TypeError]:
                     self.err_add(row, err_text=f'{col}: not float.')                                                    # ClSES.SfERRA.
 
+            for col in self.lst_dbtcols_bool:
+
+                if str(row[1][col]).split('.')[0].lower() == 'nan':
+                    row[1][col] = None
+                elif str(row[1][col]).split('.')[0].lower() in ('0', 'false'):
+                    self.df.loc[self.df[self.idx_col] == row[1][self.idx_col], col] = 'false'
+                elif str(row[1][col]).split('.')[0].lower() in ('1', 'true'):
+                    self.df.loc[self.df[self.idx_col] == row[1][self.idx_col], col] = 'true'
+                else:
+                    self.err_add(row, err_text=f'{col}: not boolean (1 - true/0 - false).')
+
+
     # ..................................................................................................................
 
-    def replace_values(self, clsf_df=None):                                                                             # SHALL BE GENERAL! SUBJ TO CORR.
-        """
-        ClSES.SfREVAL.
-        Subfunc to replace thread idxs in the ptv_veh dataframe.
-        :param clsf_df:     (DF) import dataframe.
-        :return:            (DF) altered import dataframe.
-        """
-        clsf_df['route_type'] = clsf_df.merge(self.df_tobjects,
-                                              how='left',
-                                              left_on='route_type',
-                                              right_on='tobject')['obj_id']
-        clsf_df['veh_type'] = clsf_df.merge(self.df_tobjects,
-                                            how='left',
-                                            left_on='veh_type',
-                                            right_on='tobject')['obj_id']
-        return clsf_df
+    # def replace_values(self, clsf_df=None):                                                                             # SHALL BE GENERAL! SUBJ TO CORR.
+    #     """
+    #     ClSES.SfREVAL.
+    #     Subfunc to replace thread idxs in the ptv_veh dataframe.
+    #     :param clsf_df:     (DF) import dataframe.
+    #     :return:            (DF) altered import dataframe.
+    #     """
+    #     clsf_df['route_type'] = clsf_df.merge(self.df_tobjects,
+    #                                           how='left',
+    #                                           left_on='route_type',
+    #                                           right_on='tobject')['obj_id']
+    #     clsf_df['veh_type'] = clsf_df.merge(self.df_tobjects,
+    #                                         how='left',
+    #                                         left_on='veh_type',
+    #                                         right_on='tobject')['obj_id']
+    #     return clsf_df
 
     # ..................................................................................................................
 
@@ -511,7 +550,10 @@ class Session:
         General Subfunc that imports self.df to the DB.
         :return: nothing.
         """
+        register_adapter(np.int64, AsIs)
+        register_adapter(np.float64, AsIs)
         self.engine = self.connection(clsf_dbname=self.dbase)
+        # print(self.df.info())                                                                                         # ! TEST. Info about cols of the DF to import to the DB.
         self.df.to_sql(self.dbtable,
                        con=self.engine,
                        schema=self.dbschema,
@@ -519,79 +561,76 @@ class Session:
                        index=False,
                        dtype={'okatos_reg': postgresql.ARRAY(sa.types.INTEGER)})
 
-    def import_todb(self, clsf_df, dummy_import=True, route_vehs=False):
+    def import_process(self):
         """
-        ClSES.SfIMPORT.
-        General Class Subfunc that describes the import process.
-        :param clsf_df:         (DF) import dataframe (initially loaded from the file);
-        :param dummy_import:    (bool) flag to test the process w/o final import to the DB;
-        :param route_vehs:      (bool) flag for JOINT import to ptv_vehs and ptv_routes DBTs.
-        :return:                nothing.
+        ClSES.SfIMPRO. Subfunc w/a seq. to process a single DF.
         """
         import_process = True
 
-        while import_process:
+        if (
+                self.routes_vehs
+        ) and (
+                self.mode == 2
+        ):
+            self.first_run = True
+        else:
+            self.first_run = False
 
-            self.run = 0
-            self.route_vehs = route_vehs
-
-            if self.mode == 3 and self.run == 0 and self.route_vehs is True:
+            if self.mode == 3:
                 self.veh_thread_conn()
 
-            self.df = clsf_df
+        while import_process:
 
-            # initialisation of self.df_errs dataframe.
-            self.df_errs = pd.DataFrame(columns=(self.df.columns.to_list() +
-                                                 ['error_description']))
-            self.properties()                                                                                           # ClSES.SfCOLPROP.
-            self.reindexing()                                                                                           # ClSES.SfREINDX.
-            self.primary_process()                                                                                      # ClSES.SfPRIMPRO.
-            self.line_check()                                                                                           # ClSES.SfLICHEK.
+            self.df_errs = pd.DataFrame(columns=(self.df.columns.to_list() + ['error_description']))
+            self.properties()
+            self.reindexing()
 
-            # drop of lines w/errors from the self.df DF.
-            self.df = self.df.loc[~self.df[self.idx_col].isin(self.df_errs[self.idx_col])]
+            if self.first_run:
+                self.first_run = False
 
-            # local download of the results (DIRECTORY OF THE CODE).
-            with pd.ExcelWriter('data_to_import.xlsx') as writer:
+            self.primary_process()
+            self.line_check()
+            self.df = self.df.loc[
+                ~self.df[self.idx_col].isin(self.df_errs[self.idx_col])
+            ]
+
+            with pd.ExcelWriter(os.path.join(self.import_dir,
+                                             'data_to_import.xlsx')) as writer:
                 self.df.to_excel(writer, sheet_name='data_to_import')
                 self.df_errs.to_excel(writer, sheet_name='errors')
 
-            # Report lines.
-            print(f'Строк готово к загрузке:\t{len(self.df)}\n'
-                  f'Строк с ошибками:\t\t{len(self.df_errs)}')
+            print(f'Строк готово к загрузке:\t{len(self.df)}\nСтрок с ошибками:\t\t{len(self.df_errs)}')
 
             if len(self.df_errs) > 0:
                 print('\nМассив на загрузку и ошибки - в файле data_to_import.xlsx.')
-                print('\nМожно исправить ошибки в самом файле и закончить загрузку или'
-                      ' загрузить только готовые строки и исправленные ошибки загрузить позже.')
-                option = self.choice(alternatives=[
-                    'Загрузить верные строки и ошибочные строки после исправления в текущем сеансе.',
-                    'Загрузить только верные строки. '
-                    'Строки с корректировкой будут загружены позднее отдельной загрузкой.',
-                    'Не загружать ничего.'])
+                print('\nМожно исправить ошибки в самом файле и закончить загрузку или '
+                            'загрузить только готовые строки и исправленные ошибки загрузить позже.')
+                option = self.choice(
+                    alternatives=['Загрузить верные строки и ошибочные строки после исправления в текущем сеансе.',
+                                  'Загрузить только верные строки. '
+                                    'Строки с корректировкой будут загружены позднее отдельной загрузкой.',
+                                  'Не загружать ничего.'])
 
                 if option == 1:
 
-                    if dummy_import:
+                    if self.dummy_import:
                         print('Загрузка...')
                     else:
                         print('Загрузка...')
                         self.main_import()
 
-                    print(
-                        '\nОткройте файл data_to_import.xlsx (лист errors), '
-                        'исправьте ошибки, сохраните и закройте файл.')
-                    print(
-                        'УЧТИТЕ: словарь dct_reindexing и файл data_to_import будут перезаписаны. '
-                        'Cкопируйте файлы при необходимости.')
+                    print('\nОткройте файл data_to_import.xlsx (лист errors), '
+                                 'исправьте ошибки, сохраните и закройте файл.')
+                    print('УЧТИТЕ: словарь dct_reindexing и файл data_to_import будут перезаписаны. '
+                                'Cкопируйте файлы при необходимости.')
                     input('После закрытия файла нажмите любую клавишу...')
-                    clsf_df = pd.read_excel('data_to_import.xlsx',
-                                            sheet_name='errors')
+                    self.df = pd.read_excel(os.path.join(self.import_dir,
+                                                         'data_to_import.xlsx'), sheet_name='errors')
 
                 elif option == 2:
                     import_process = False
 
-                    if dummy_import:
+                    if self.dummy_import:
                         print('Загрузка...')
                     else:
                         print('Загрузка...')
@@ -602,7 +641,7 @@ class Session:
 
             else:
 
-                if dummy_import:
+                if self.dummy_import:
                     print('Загрузка...')
                 else:
                     print('Загрузка...')
@@ -610,8 +649,45 @@ class Session:
 
                 import_process = False
 
-            if self.route_vehs:
-                self.run += 1
+    def import_todb(self, clsf_df, dummy_import=True):
+        """
+        ClSES.SfIMPORT.
+        General Class Subfunc that describes the import process.
+        :param clsf_df:         (DF) import dataframe (initially loaded from the file);
+        :param dummy_import:    (bool) flag to test the process w/o final import to the DB;
+        :param route_vehs:      (bool) flag for JOINT import to ptv_vehs and ptv_routes DBTs.
+        :return:                nothing.
+        """
+        self.dummy_import = dummy_import
+
+        if self.mode == 2:
+            print('Совместная загрузка с ptv_vehs?')
+
+            if self.choice(alternatives=['Да', 'Нет']) == 1:
+                self.routes_vehs = True
+            else:
+                self.routes_vehs = False
+
+        else:
+            self.routes_vehs = False
+
+        dataframes_to_import = [clsf_df]
+
+        if self.routes_vehs:
+            filename_vehs = input('Введите название файла включая расширение с данными для ptv_vehs: ')
+            sheetname_vehs = input('Введите название листа, где содержатся данные ptv_vehs: ')
+            clsf_df_vehs = pd.read_excel(os.path.join(self.import_dir,
+                                                      filename_vehs), sheet_name=sheetname_vehs)
+            dataframes_to_import += [clsf_df_vehs]
+
+        for df in dataframes_to_import:
+            self.df = df
+            self.import_process()
+
+            if self.routes_vehs:
+                self.dbtable = 'ptv_vehs'
+                self.mode = self.modes[self.dbtable]
+                self.idx_col = self.idx_cols[self.mode]
 
     def __repr__(self):
         return f'Соединение с сервером:' \
@@ -622,3 +698,20 @@ class Session:
                f'\n-таблица:\t{self.dbtable},' \
                f'\n-пользователь:\t{self.dbuser},' \
                f'\n-пароль:\t{self.dbpass}'
+
+
+import_directory = input('Введите название директории (по-умолчанию - import_dir 2 ур. выше): ')
+
+if import_directory == '':
+    import_directory = os.path.abspath(os.path.join(os.pardir, os.pardir, 'import_dir'))
+
+filename = input('Введите название файла включая расширение: ')
+sheetname = input('Введите название листа, где содержатся данные: ')
+dbbase = input('Введите название БД: ')
+dbtable = input('Введите название таблицы БД: ')
+dbuser = input('Пользователь: ')
+dbpass = input('Пароль: ')
+
+ses = Session(cl_dbase=dbbase, cl_dbtable=dbtable, cl_user=dbuser, cl_pass=dbpass, cl_directory=import_directory)
+df = pd.read_excel(os.path.join(import_directory, filename), sheetname)
+ses.import_todb(df, dummy_import=False)
