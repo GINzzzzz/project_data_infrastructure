@@ -29,9 +29,12 @@ class Session:
         self.dbgeneral = 'amotex_general'                                                                               # general GDB w/admin and ref tables.
         self.dbschema = 'datatables'                                                                                    # standard schema w/data storage.
         self.dbdicts = 'dicts'                                                                                          # standard schema in GDB w/reference tables.
+        self.dbadmin = 'ftproject_admin'
         self.dbdct_objects = 'tobjects'                                                                                 # ref. tbl w/transobject types.
         self.dbdct_fuels = 'fuel_types'                                                                                 # ref. tbl w/fuel types.
         self.dbdct_regions = 'codes_regions'                                                                            # ref. tbl w/OKATO, plate codes, names of regions.
+        self.dbt_projects = 'projects'
+        self.dbt_docs = 'project_docs'
 
         # ClSES.1 Init vars.
         self.import_dir = cl_directory
@@ -112,6 +115,7 @@ class Session:
                                 (DF) as regions' attributes;
         -   self.df_tobjects:   (DF) dict. of transport object types;
         -   self.df_fuels:      (DF) dict. of fuel types.
+        -   self.df_projects:   (DF) project list.
         :return:                nothing, changes class attributes.
         """
         clsf_engine = self.connection(clsf_dbname=self.dbgeneral)
@@ -132,6 +136,21 @@ class Session:
                                            clsf_dbschema=self.dbdicts)),
                 con=connection
             )
+
+            if self.mode == 4:
+
+                self.df_projects = pd.read_sql(
+                    sa.text(self.download_data(clsf_dbtable=self.dbt_projects,
+                                               clsf_dbschema=self.dbadmin)),
+                    con=connection
+                )
+
+                self.df_project_docs = pd.read_sql(
+                    sa.text(self.download_data(clsf_dbtable=self.dbt_docs,
+                                               clsf_dbschema=self.dbadmin)),
+                    con=connection
+                )
+
             connection.close()                                                                                          # !!! NB !!! connection closed
             clsf_engine.dispose()                                                                                       # !!! NB !!! engine disposed.
 
@@ -177,12 +196,19 @@ class Session:
                 sa.text(query_cols_props),
                 con=connection
             )
-            self.existing_idxs = pd.read_sql(
-                sa.text(self.download_data(clsf_dbtable=self.dbtable,
-                                           clsf_dbschema=self.dbschema,
-                                           clsf_cols=['id_line', self.idx_col])),
-                con=connection
-            )
+
+            if self.mode != 4:
+                self.existing_idxs = pd.read_sql(
+                    sa.text(self.download_data(clsf_dbtable=self.dbtable,
+                                               clsf_dbschema=self.dbschema,
+                                               clsf_cols=['id_line', self.idx_col])),
+                    con=connection)
+            else:
+                self.existing_idxs = pd.read_sql(
+                    sa.text(self.download_data(clsf_dbtable=self.dbtable,
+                                               clsf_dbschema=self.dbschema,
+                                               clsf_cols=[self.idx_col, 'sn_main', 'sn_sub', 'sn_fin'])),
+                    con=connection)
             connection.close()                                                                                          # !!! NB !!! connection closed
             clsf_engine.dispose()                                                                                       # !!! NB !!! engine disposed.
 
@@ -214,6 +240,71 @@ class Session:
         ].to_list()
 
     # ...MAIN..SERVICE..CLASS..SUBFUNCTIONS.............................................................................
+
+    def act_indexing(self):
+        """
+        ClSES.SfINDX.
+        Indexing subfunc.
+        Subfunc adds new id_act column and defines the bigint value for each string. Key for id_act:
+        - [X][][][][] - (2-5 digits) okato_reg;
+        - [][X][][][] - (3 digits) first 3 digits of object type code;
+        - [][][x][][] - (1+ digits) sn_main;
+        - [][][][x][] - (1+ digits) sn_sub;
+        - [][][][][x] - (1 digit) sn_fin.
+        :return: nothing, changes initial dataframe self.df.
+        """
+        for col in ['sn_main', 'sn_sub', 'sn_fin']:
+            self.df[col].apply(lambda x: None if x == '' else x)
+
+        self.df = self.df.reset_index(drop=True)
+        self.df[['sn_main', 'sn_sub', 'sn_fin']] = self.df[['sn_main', 'sn_sub', 'sn_fin']].fillna(0).astype('int64')
+        self.df['id_project'] = self.df['id_project'].fillna(0).astype('int64')
+        self.df['id_act'] = (
+            self.df.merge(
+                self.df_projects[['id_project',
+                                  'okato_reg']],
+                how='left',
+                left_on='id_project',
+                right_on='id_project')['okato_reg'].astype('str') +
+            self.df['object_type'].astype('str').apply(lambda x: x[:3]) +
+            self.df['sn_main'].astype('str') +
+            self.df['sn_sub'].astype('str') +
+            self.df['sn_fin'].astype('str')
+        ).fillna(0).astype('int64')
+
+        self.df['id_parent'] = 0
+
+        self.df_main = self.df.loc[(self.df['sn_sub'] == 0) & (self.df['sn_fin'] == 0)].reset_index(drop=True)
+
+        self.df_sub = self.df.loc[self.df['sn_sub'] > 0].reset_index(drop=True)
+        self.df_fin = self.df.loc[self.df['sn_fin'] > 0].reset_index(drop=True)
+
+        if self.dummy_import and self.first_run is False:
+            self.existing_idxs = self.dbimit
+
+        self.df_main['id_parent'] = None
+        existing_idxs_ext = pd.concat([self.existing_idxs, self.df_main], ignore_index=True)
+        self.df_sub['id_parent'] = self.df_sub.merge(existing_idxs_ext.loc[existing_idxs_ext['sn_sub'] == 0],
+                                                     how='left',
+                                                     on=['sn_main'],
+                                                     suffixes=(None, '_sub'))['id_act_sub']
+        self.df = pd.concat([self.df_main, self.df_sub], ignore_index=True)
+        existing_idxs_ext = pd.concat([existing_idxs_ext, self.df], ignore_index=True)
+        self.df_fin['id_parent'] = self.df_fin.merge(existing_idxs_ext.loc[existing_idxs_ext['sn_fin'] == 0],
+                                               how='left',
+                                               on=['sn_main', 'sn_sub'], suffixes=(None, '_fin'))['id_act_fin']
+        self.df = pd.concat([self.df, self.df_fin], ignore_index=True)
+
+        parental_errs = self.df.loc[((self.df['sn_sub'] > 0) | (self.df['sn_fin'] > 0)) &
+                                    self.df['id_parent'].isna()]
+        parental_errs['error_description'] = 'parental idx cannot be set'
+        self.df_errs = pd.concat([self.df_errs, parental_errs], ignore_index=True)
+        self.df = self.df.loc[~self.df['id_act'].isin(parental_errs['id_act'])]
+
+        if self.dummy_import:
+            self.dbimit = pd.concat([self.existing_idxs,
+                                     self.df.loc[~self.df[self.idx_col].isin(self.existing_idxs[self.idx_col])]],
+                                    ignore_index=True)
 
     def reindexing(self):
         """
@@ -333,7 +424,8 @@ class Session:
             req_cols = ['id_vehset', 'threads_idxs', 'veh_type']
             ref_cols = ['veh_type', 'fuel_type']
         elif self.mode == 4:
-            ref_cols = ['object_type', 'id_project', 'docs_idxs']
+            req_cols = ['sn_main', 'id_project']
+            ref_cols = ['object_type', 'id_project']
 
         primary_errs = []
 
@@ -394,13 +486,48 @@ class Session:
             self.df['okatos_reg'] = local
             primary_errs.append(okatos_errs)
 
+        if 'docs_idxs' in self.df.columns.to_list():
+            local = self.df.loc[
+                    :, 'docs_idxs'
+                    ].apply(lambda x:
+                            x[1:-1]
+                            if '[' in str(x)
+                            else str(x)).str.replace(', ', ',').str.split(',')
+
+            local = local.apply(lambda x:
+                                [self.df_project_docs.loc[
+                                     self.df_project_docs.doc_name == i,
+                                     'id_doc'
+                                 ].values[0]
+                                 if ((i.isnumeric() is False) and
+                                     len(self.df_project_docs.loc[
+                                             self.df_project_docs.doc_name == i,
+                                             'id_doc'
+                                         ]) > 0)
+                                 else i
+                                if i.isnumeric()
+                                else None
+                                 for i in x
+                                 ]).apply(lambda x:
+                                          [int(i) if i is not None else None for i in x])
+
+            self.df['docs_idxs'] = local
+
+        if 'objects_idxs' in self.df.columns.to_list():
+            self.df['objects_idxs'] = self.df['objects_idxs'].astype('str').str.split(',').apply(
+                lambda x:
+                [None if i == 'nan' else i for i in x]
+            )
+
         for col in ref_cols:
 
             # local dct to define specific reference columns.
-            dct_reftables = {'object_type': [self.df_tobjects, 'tobject', 'obj_id'],
+            dct_reftables = {'id_project': [self.df_projects, 'project_name', 'id_project'],
+                             'object_type': [self.df_tobjects, 'tobject', 'obj_id'],
                              'thread_type': [self.df_tobjects, 'tobject', 'obj_id'],
                              'veh_type': [self.df_tobjects, 'tobject', 'obj_id'],
-                             'fuel_type': [self.df_fuels, 'fuel', 'id_type']}
+                             'fuel_type': [self.df_fuels, 'fuel', 'id_type'],
+                             }
             reftable = dct_reftables[col]
 
             # local var inside for-cycle to process.
@@ -445,7 +572,7 @@ class Session:
         :param err_text:    (str) error descript to add to the self.df_errs.
         :return:            nothing, changes self.df_errs.
         """
-        self.df_errs = pd.concat([self.df_errs, add_row[1].to_frame().T])
+        self.df_errs = pd.concat([self.df_errs, add_row[1].to_frame().T], ignore_index=True)
         self.df_errs.iloc[len(self.df_errs) - 1, -1] = f'{err_text}'
 
     def line_check(self):
@@ -573,6 +700,8 @@ class Session:
                 self.mode == 2
         ):
             self.first_run = True
+        elif self.mode == 4:
+            self.first_run = True
         else:
             self.first_run = False
 
@@ -583,16 +712,28 @@ class Session:
 
             self.df_errs = pd.DataFrame(columns=(self.df.columns.to_list() + ['error_description']))
             self.properties()
-            self.reindexing()
 
-            if self.first_run:
+            if self.mode != 4:
+                self.reindexing()
+            else:
+                self.df['id_act'] = self.df.index
+
+            if self.first_run and self.mode != 4:
                 self.first_run = False
 
             self.primary_process()
+
             self.line_check()
+
             self.df = self.df.loc[
                 ~self.df[self.idx_col].isin(self.df_errs[self.idx_col])
             ]
+
+            if self.mode == 4:
+                self.act_indexing()
+
+            if self.first_run and self.mode == 4:
+                self.first_run = False
 
             with pd.ExcelWriter(os.path.join(self.import_dir,
                                              'data_to_import.xlsx')) as writer:
@@ -625,7 +766,8 @@ class Session:
                                 'Cкопируйте файлы при необходимости.')
                     input('После закрытия файла нажмите любую клавишу...')
                     self.df = pd.read_excel(os.path.join(self.import_dir,
-                                                         'data_to_import.xlsx'), sheet_name='errors')
+                                                         'data_to_import.xlsx'),
+                                            sheet_name='errors').drop(columns = 'error_description')
 
                 elif option == 2:
                     import_process = False
